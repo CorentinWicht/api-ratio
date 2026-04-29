@@ -25,7 +25,11 @@ async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
 
     try:
         logger.info("La Cale: Attempting automated login...")
-        await page.goto(LOGIN_PAGE_URL, wait_until="networkidle")
+        # Don't use wait_until="networkidle" — la-cale.space has background
+        # network activity (likely Cloudflare's bot-detection JS or telemetry)
+        # that prevents the page from ever reaching idle. Use the default
+        # "load" event, same as c411.
+        await page.goto(LOGIN_PAGE_URL)
         await asyncio.sleep(2)
 
         await page.fill('input[type="email"], input[name="email"], input[placeholder*="mail"]', email)
@@ -68,10 +72,16 @@ async def get_stats(headless: bool = True) -> Dict[str, Any]:
         try:
             res: Dict[str, Any] = {"raw_upload": 0, "raw_download": 0}
 
+            # Try cached cookies first; if the file doesn't exist OR the login
+            # flow fails to produce one, surface a clean error instead of
+            # falling into the misleading FileNotFoundError downstream.
+            cookies = None
             try:
                 cookies = load_file(COOKIES_FILE, is_json=True)
             except FileNotFoundError:
-                await _get_lacale_cookies(context, page)
+                logger.info("La Cale: No cached cookies, attempting login...")
+                if not await _get_lacale_cookies(context, page):
+                    raise ScrappingError("La Cale: Failed to authenticate (initial login)")
                 cookies = load_file(COOKIES_FILE, is_json=True)
 
             await context.add_cookies(cookies)
@@ -87,17 +97,16 @@ async def get_stats(headless: bool = True) -> Dict[str, Any]:
 
             if not api_data.get("id"):
                 logger.warning("La Cale: Session expired or invalid, re-logging in...")
-                if await _get_lacale_cookies(context, page):
-                    cookies = load_file(COOKIES_FILE, is_json=True)
-                    await context.add_cookies(cookies)
-                    await page.goto(USER_STATS_URL)
-                    content = await page.inner_text("body")
-                    try:
-                        api_data = json.loads(content)
-                    except json.JSONDecodeError:
-                        api_data = {}
-                else:
-                    raise ScrappingError("La Cale: Failed to authenticate")
+                if not await _get_lacale_cookies(context, page):
+                    raise ScrappingError("La Cale: Failed to authenticate (after session expiry)")
+                cookies = load_file(COOKIES_FILE, is_json=True)
+                await context.add_cookies(cookies)
+                await page.goto(USER_STATS_URL)
+                content = await page.inner_text("body")
+                try:
+                    api_data = json.loads(content)
+                except json.JSONDecodeError:
+                    api_data = {}
 
             res["raw_upload"] = float(api_data.get("uploaded", 0))
             res["raw_download"] = float(api_data.get("downloaded", 0))
