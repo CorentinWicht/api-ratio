@@ -17,7 +17,7 @@ USER_STATS_URL = "https://la-cale.space/api/internal/me"
 
 
 async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
-    """Navigate login page with Playwright to bypass anti-bot, handle optional 2FA, then save session cookies"""
+    """Automated login to get fresh La Cale cookies if missing or expired."""
     email = os.getenv("LACALE_USER")
     password = os.getenv("LACALE_PASS")
     if not (email and password):
@@ -32,26 +32,28 @@ async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
         await page.fill('input[type="password"], input[name="password"], input[placeholder*="assword"]', password)
         await asyncio.sleep(1)
 
-        btn = await page.query_selector('button[type="submit"], button:has-text("Connexion"), button:has-text("Se connecter")')
+        btn = await page.query_selector(
+            'button[type="submit"], button:has-text("Connexion"), button:has-text("Se connecter")'
+        )
         if btn:
             await btn.click()
         else:
             await page.keyboard.press("Enter")
 
-        await asyncio.sleep(4)
+        await asyncio.sleep(5)
 
-        # Validate session by calling /me
-        response = await ctx.request.get(USER_STATS_URL)
-        if response.ok:
-            api_data = await response.json()
-            if api_data.get("id"):
-                cookies = await ctx.cookies()
-                write_file(COOKIES_FILE, json.dumps(cookies))
-                logger.info(f"La Cale: Login successful as {api_data.get('username')}, cookies saved.")
-                return True
-            logger.error(f"La Cale: Login response unexpected: {api_data}")
-        else:
-            logger.error(f"La Cale: /me returned {response.status} after login")
+        # Validate session by navigating to /me through the browser (not ctx.request),
+        # so Cloudflare sees a real browser and lets the API call through.
+        await page.goto(USER_STATS_URL)
+        content = await page.inner_text("body")
+        api_data = json.loads(content)
+
+        if api_data.get("id"):
+            cookies = await ctx.cookies()
+            write_file(COOKIES_FILE, json.dumps(cookies))
+            logger.info(f"La Cale: Login successful as {api_data.get('username')}, cookies saved.")
+            return True
+        logger.error(f"La Cale: Login response unexpected: {api_data}")
     except Exception as e:
         logger.error(f"La Cale: Login failed: {e}")
 
@@ -73,16 +75,27 @@ async def get_stats(headless: bool = True) -> Dict[str, Any]:
                 cookies = load_file(COOKIES_FILE, is_json=True)
 
             await context.add_cookies(cookies)
-            response = await context.request.get(USER_STATS_URL)
-            api_data = await response.json() if response.ok else {}
+
+            # Use browser navigation rather than ctx.request — same reason as in
+            # _get_lacale_cookies above (Cloudflare blocks non-browser API calls).
+            await page.goto(USER_STATS_URL)
+            content = await page.inner_text("body")
+            try:
+                api_data = json.loads(content)
+            except json.JSONDecodeError:
+                api_data = {}
 
             if not api_data.get("id"):
                 logger.warning("La Cale: Session expired or invalid, re-logging in...")
                 if await _get_lacale_cookies(context, page):
                     cookies = load_file(COOKIES_FILE, is_json=True)
                     await context.add_cookies(cookies)
-                    response = await context.request.get(USER_STATS_URL)
-                    api_data = await response.json() if response.ok else {}
+                    await page.goto(USER_STATS_URL)
+                    content = await page.inner_text("body")
+                    try:
+                        api_data = json.loads(content)
+                    except json.JSONDecodeError:
+                        api_data = {}
                 else:
                     raise ScrappingError("La Cale: Failed to authenticate")
 
