@@ -13,11 +13,19 @@ logger = logging.getLogger()
 
 COOKIES_FILE = "lacale_cookies.json"
 LOGIN_PAGE_URL = "https://la-cale.space/login"
+LOGIN_API_URL = "https://la-cale.space/api/internal/auth/login"
 USER_STATS_URL = "https://la-cale.space/api/internal/me"
+
+# La Cale's backend uses a `formLoadedAt` timestamp that the frontend embeds
+# in the login POST body. If the time between page load and submit is too
+# short (< ~15s), the server flags it as bot-like and rejects with 400 +
+# challenge_required, escalating to ALTCHA. Real humans take 30-60 seconds
+# to type credentials and click submit. We mimic that by waiting before the
+# click. Total page-load-to-submit delay: ~35s (page goto + 2s + fill + 30s).
+HUMAN_DELAY_SECONDS = 30
 
 
 async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
-    """Automated login to get fresh La Cale cookies if missing or expired."""
     email = os.getenv("LACALE_USER")
     password = os.getenv("LACALE_PASS")
     if not (email and password):
@@ -25,39 +33,33 @@ async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
 
     try:
         logger.info("La Cale: Attempting automated login...")
-        # Don't use wait_until="networkidle" — la-cale.space has background
-        # network activity (likely Cloudflare's bot-detection JS or telemetry)
-        # that prevents the page from ever reaching idle. Use the default
-        # "load" event, same as c411.
-        await page.goto(LOGIN_PAGE_URL)
+        await page.goto(LOGIN_PAGE_URL, wait_until="networkidle")
         await asyncio.sleep(2)
 
-        await page.fill('input[type="email"], input[name="email"], input[placeholder*="mail"]', email)
-        await page.fill('input[type="password"], input[name="password"], input[placeholder*="assword"]', password)
-        await asyncio.sleep(1)
+        await page.fill('input[type="email"], input[name="email"]', email)
+        await page.fill('input[type="password"], input[name="password"]', password)
 
-        btn = await page.query_selector(
-            'button[type="submit"], button:has-text("Connexion"), button:has-text("Se connecter")'
-        )
-        if btn:
-            await btn.click()
+        # Wait long enough that formLoadedAt-based bot detection accepts
+        # this as a human submission. Without this delay the server returns
+        # 400 + challenge_required and forces ALTCHA.
+        logger.info(f"La Cale: Pausing {HUMAN_DELAY_SECONDS}s before submit (anti-bot timing)...")
+        await asyncio.sleep(HUMAN_DELAY_SECONDS)
+
+        await page.click('button[type="submit"]')
+        await asyncio.sleep(4)
+
+        # Validate session by calling /me.
+        response = await ctx.request.get(USER_STATS_URL)
+        if response.ok:
+            api_data = await response.json()
+            if api_data.get("id"):
+                cookies = await ctx.cookies()
+                write_file(COOKIES_FILE, json.dumps(cookies))
+                logger.info(f"La Cale: Login successful as {api_data.get('username')}, cookies saved.")
+                return True
+            logger.error(f"La Cale: /me returned no user: {api_data}")
         else:
-            await page.keyboard.press("Enter")
-
-        await asyncio.sleep(5)
-
-        # Validate session by navigating to /me through the browser (not ctx.request),
-        # so Cloudflare sees a real browser and lets the API call through.
-        await page.goto(USER_STATS_URL)
-        content = await page.inner_text("body")
-        api_data = json.loads(content)
-
-        if api_data.get("id"):
-            cookies = await ctx.cookies()
-            write_file(COOKIES_FILE, json.dumps(cookies))
-            logger.info(f"La Cale: Login successful as {api_data.get('username')}, cookies saved.")
-            return True
-        logger.error(f"La Cale: Login response unexpected: {api_data}")
+            logger.error(f"La Cale: /me returned {response.status} after login")
     except Exception as e:
         logger.error(f"La Cale: Login failed: {e}")
 
@@ -72,41 +74,26 @@ async def get_stats(headless: bool = True) -> Dict[str, Any]:
         try:
             res: Dict[str, Any] = {"raw_upload": 0, "raw_download": 0}
 
-            # Try cached cookies first; if the file doesn't exist OR the login
-            # flow fails to produce one, surface a clean error instead of
-            # falling into the misleading FileNotFoundError downstream.
-            cookies = None
             try:
                 cookies = load_file(COOKIES_FILE, is_json=True)
             except FileNotFoundError:
-                logger.info("La Cale: No cached cookies, attempting login...")
                 if not await _get_lacale_cookies(context, page):
-                    raise ScrappingError("La Cale: Failed to authenticate (initial login)")
+                    raise ScrappingError("La Cale: Failed to authenticate")
                 cookies = load_file(COOKIES_FILE, is_json=True)
 
             await context.add_cookies(cookies)
-
-            # Use browser navigation rather than ctx.request — same reason as in
-            # _get_lacale_cookies above (Cloudflare blocks non-browser API calls).
-            await page.goto(USER_STATS_URL)
-            content = await page.inner_text("body")
-            try:
-                api_data = json.loads(content)
-            except json.JSONDecodeError:
-                api_data = {}
+            response = await context.request.get(USER_STATS_URL)
+            api_data = await response.json() if response.ok else {}
 
             if not api_data.get("id"):
                 logger.warning("La Cale: Session expired or invalid, re-logging in...")
-                if not await _get_lacale_cookies(context, page):
-                    raise ScrappingError("La Cale: Failed to authenticate (after session expiry)")
-                cookies = load_file(COOKIES_FILE, is_json=True)
-                await context.add_cookies(cookies)
-                await page.goto(USER_STATS_URL)
-                content = await page.inner_text("body")
-                try:
-                    api_data = json.loads(content)
-                except json.JSONDecodeError:
-                    api_data = {}
+                if await _get_lacale_cookies(context, page):
+                    cookies = load_file(COOKIES_FILE, is_json=True)
+                    await context.add_cookies(cookies)
+                    response = await context.request.get(USER_STATS_URL)
+                    api_data = await response.json() if response.ok else {}
+                else:
+                    raise ScrappingError("La Cale: Failed to authenticate")
 
             res["raw_upload"] = float(api_data.get("uploaded", 0))
             res["raw_download"] = float(api_data.get("downloaded", 0))
