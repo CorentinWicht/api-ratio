@@ -2,6 +2,8 @@ import asyncio
 import os
 import json
 import logging
+import time
+from pathlib import Path
 from typing import Dict, Any
 from playwright.async_api import async_playwright, BrowserContext, Page
 from dotenv import load_dotenv
@@ -11,6 +13,8 @@ from util import default_user_agent, load_file, write_file, MissingCredentialsEr
 load_dotenv()
 logger = logging.getLogger()
 
+LOCKOUT_FILE = Path(".config/lacale_lockout")
+LOCKOUT_DURATION = 3600  # 1 hour
 COOKIES_FILE = "lacale_cookies.json"
 LOGIN_PAGE_URL = "https://la-cale.space/login"
 LOGIN_API_URL = "https://la-cale.space/api/internal/auth/login"
@@ -24,8 +28,18 @@ USER_STATS_URL = "https://la-cale.space/api/internal/me"
 # click. Total page-load-to-submit delay: ~35s (page goto + 2s + fill + 30s).
 HUMAN_DELAY_SECONDS = 30
 
-
 async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
+    # Honor self-imposed lockout from previous failures.
+    if LOCKOUT_FILE.exists():
+        try:
+            lockout_until = float(LOCKOUT_FILE.read_text().strip())
+        except (ValueError, OSError):
+            lockout_until = 0
+        if time.time() < lockout_until:
+            remaining = int(lockout_until - time.time())
+            logger.warning(f"La Cale: in self-imposed lockout for {remaining}s more")
+            return False
+
     email = os.getenv("LACALE_USER")
     password = os.getenv("LACALE_PASS")
     if not (email and password):
@@ -35,20 +49,14 @@ async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
         logger.info("La Cale: Attempting automated login...")
         await page.goto(LOGIN_PAGE_URL, wait_until="networkidle")
         await asyncio.sleep(2)
-
         await page.fill('input[type="email"], input[name="email"]', email)
         await page.fill('input[type="password"], input[name="password"]', password)
 
-        # Wait long enough that formLoadedAt-based bot detection accepts
-        # this as a human submission. Without this delay the server returns
-        # 400 + challenge_required and forces ALTCHA.
         logger.info(f"La Cale: Pausing {HUMAN_DELAY_SECONDS}s before submit (anti-bot timing)...")
         await asyncio.sleep(HUMAN_DELAY_SECONDS)
-
         await page.click('button[type="submit"]')
         await asyncio.sleep(4)
 
-        # Validate session by calling /me.
         response = await ctx.request.get(USER_STATS_URL)
         if response.ok:
             api_data = await response.json()
@@ -56,6 +64,8 @@ async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
                 cookies = await ctx.cookies()
                 write_file(COOKIES_FILE, json.dumps(cookies))
                 logger.info(f"La Cale: Login successful as {api_data.get('username')}, cookies saved.")
+                # Clear any previous lockout on a successful login.
+                LOCKOUT_FILE.unlink(missing_ok=True)
                 return True
             logger.error(f"La Cale: /me returned no user: {api_data}")
         else:
@@ -63,8 +73,10 @@ async def _get_lacale_cookies(ctx: BrowserContext, page: Page) -> bool:
     except Exception as e:
         logger.error(f"La Cale: Login failed: {e}")
 
+    # Any path that gets here = login failed. Set lockout to avoid hammering.
+    LOCKOUT_FILE.write_text(str(time.time() + LOCKOUT_DURATION))
+    logger.warning(f"La Cale: login failed — locking out for {LOCKOUT_DURATION}s")
     return False
-
 
 async def get_stats(headless: bool = True) -> Dict[str, Any]:
     async with async_playwright() as p:
