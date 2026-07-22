@@ -58,8 +58,15 @@ async def get_stats(_: bool = False) -> Dict[str, Any]:
     if not user:
         raise ScrappingError("DigitalCore: no 'user' object in login response")
 
+    # DigitalCore reports downloaded=1 (1 byte) instead of 0 when nothing has
+    # been downloaded yet. Treat any value ≤ 1 as zero so the central ratio
+    # logic in api.py correctly resolves it to 999 (infinite ratio).
+    raw_download = float(user.get("downloaded", 0))
+    if raw_download <= 1:
+        raw_download = 0.0
+
     return {
         "raw_upload": float(user.get("uploaded", 0)),
-        "raw_download": float(user.get("downloaded", 0)),
+        "raw_download": raw_download,
         "bonus": float(user.get("bonuspoang", 0)),
     }
