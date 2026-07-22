@@ -25,7 +25,7 @@ async def get_stats(_: bool = False) -> Dict[str, Any]:
     api_key = os.getenv("TR4KER_TOKEN")
     if not api_key:
         raise MissingCredentialsError(
-            "Missing TR4KER_API_KEY — generate one at "
+            "Missing TR4KER_TOKEN — generate one at "
             "tr4ker.net → Mon Compte → Profil → Clé API and set it in .env."
         )
 
